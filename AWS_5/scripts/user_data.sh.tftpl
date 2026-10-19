@@ -1,0 +1,70 @@
+#!/bin/bash
+# Instala Docker y levanta Neo4j Community y Grafana en la EC2 (Amazon Linux 2023)
+set -euxo pipefail
+
+dnf install -y docker
+systemctl enable --now docker
+
+# Red de Docker compartida: Grafana llega a Neo4j como bolt://neo4j:7687
+docker network create judge
+
+# ---------------------------------------------------------------- Neo4j
+mkdir -p /data/neo4j /logs/neo4j
+
+docker run -d --name neo4j --network judge --restart always \
+  -p 7474:7474 -p 7687:7687 \
+  -v /data/neo4j:/data \
+  -v /logs/neo4j:/logs \
+  -e NEO4J_AUTH='neo4j/${neo4j_password}' \
+  -e NEO4J_server_memory_heap_initial__size=1G \
+  -e NEO4J_server_memory_heap_max__size=1G \
+  -e NEO4J_server_memory_pagecache_size=1G \
+  -e NEO4J_db_transaction_timeout=60s \
+  ${neo4j_image}
+
+# ---------------------------------------------------------------- Grafana
+mkdir -p /opt/grafana/provisioning/datasources /opt/grafana/provisioning/dashboards /opt/grafana/dashboards
+
+# Fuente CloudWatch: usa las credenciales del rol de la EC2 (LabInstanceProfile)
+cat > /opt/grafana/provisioning/datasources/cloudwatch.yaml <<'YAML'
+apiVersion: 1
+datasources:
+  - name: CloudWatch
+    type: cloudwatch
+    uid: cloudwatch
+    isDefault: true
+    jsonData:
+      authType: default
+      defaultRegion: ${region}
+YAML
+
+cat > /opt/grafana/provisioning/dashboards/lab5.yaml <<'YAML'
+apiVersion: 1
+providers:
+  - name: lab5
+    folder: Lab 5
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards
+YAML
+
+# Dashboard del pipeline (lo arma Terraform en infra/grafana.tf)
+echo '${dashboard_b64}' | base64 -d | gunzip > /opt/grafana/dashboards/pipeline.json
+chmod -R a+rX /opt/grafana
+
+docker run -d --name grafana --network judge --restart always \
+  -p 3000:3000 \
+  -v grafana-data:/var/lib/grafana \
+  -v /opt/grafana/provisioning:/etc/grafana/provisioning:ro \
+  -v /opt/grafana/dashboards:/var/lib/grafana/dashboards:ro \
+  -e GF_SECURITY_ADMIN_PASSWORD='${grafana_password}' \
+  -e GF_INSTALL_PLUGINS=${neo4j_plugin} \
+  -e GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=${neo4j_plugin} \
+  ${grafana_image}
+
+# ---------------------------------------------------------------- espera
+for i in $(seq 1 60); do
+  curl -sf http://localhost:7474 >/dev/null && echo "Neo4j listo" && exit 0
+  sleep 5
+done
+echo "Neo4j no respondió a tiempo" >&2

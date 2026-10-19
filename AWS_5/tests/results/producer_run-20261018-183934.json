@@ -1,0 +1,32 @@
+{
+  "sent": 5092,
+  "bytes": 15840363,
+  "calls": 74,
+  "throttled": 0,
+  "api_retries": 0,
+  "other_errors": 0,
+  "plagio_injected": 92,
+  "corrupt_injected": 0,
+  "run_id": "run-20261018-183934",
+  "via": "api",
+  "stream": "judge-stream-submissions",
+  "elapsed_s": 17.29,
+  "rate_target": 300.0,
+  "rate_real": 294.4,
+  "mb": 15.11,
+  "fp_ms_total": 2504.5,
+  "fp_k": 12,
+  "fp_w": 4,
+  "source": "synthetic:5000",
+  "api_batch_p50_ms": 162.3,
+  "api_batch_p95_ms": 276.4,
+  "consumer_config": {
+    "api_burst_limit": 1000,
+    "api_rate_limit": 500,
+    "batch_size": 100,
+    "batching_window": 1,
+    "lambda_memory": 256,
+    "parallelization_factor": 1,
+    "shards": 1
+  }
+}

@@ -1,0 +1,47 @@
+# .gitignore del lab (aplica a AWS_N/ y k3s_N/)
+
+# --- Terraform ---
+# Carpeta local de providers y módulos (se regenera con terraform init)
+.terraform/
+
+# State: contiene la llave privada y datos sensibles de la infraestructura
+*.tfstate
+*.tfstate.*
+
+# Logs de fallos de Terraform
+crash.log
+crash.*.log
+
+# Archivos de variables con posibles valores sensibles
+*.tfvars
+*.tfvars.json
+
+# Overrides locales
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Archivos de planes guardados
+*.tfplan
+
+# CLI config local
+.terraformrc
+terraform.rc
+
+# --- Llaves y credenciales ---
+*.pem
+*.key
+.aws/
+kubeconfig*
+
+# --- Build / Python ---
+.build/
+__pycache__/
+
+# --- Sistema operativo / editor ---
+Thumbs.db
+Desktop.ini
+.DS_Store
+.vscode/
+.idea/

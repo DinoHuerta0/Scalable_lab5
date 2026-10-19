@@ -1,0 +1,8 @@
+# Los scripts que corren en Linux deben tener finales de línea LF aunque se editen en Windows
+*.sh     text eol=lf
+*.tftpl  text eol=lf
+*.py     text eol=lf
+*.yaml   text eol=lf
+*.txt    text eol=lf
+Dockerfile text eol=lf
+*.ps1    text eol=crlf
