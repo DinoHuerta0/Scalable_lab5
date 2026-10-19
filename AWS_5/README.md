@@ -4,7 +4,7 @@
 > Autor(es): Victor Sebastian Sanchez Silva
 > Fecha: 2026-10-18
 
-Despliega con Terraform un pipeline de streaming para un juez en línea tipo HackerRank. El juez manda cada envío calificado a una **API Gateway** protegida con **API key**. Una Lambda de ingesta lo publica en **Kinesis Data Streams**, otra **AWS Lambda** lo valida, lo limpia y lo carga en **Neo4j** (base de datos de grafos), y **Grafana** muestra el estado del pipeline y las analíticas. La versión open source del mismo pipeline estará en [`k3s_5`](../k3s_5).
+Despliega con Terraform un pipeline de streaming para un juez en línea tipo HackerRank. El juez manda cada envío calificado a una **API Gateway** protegida con **API key**. Una Lambda de ingesta lo publica en **Kinesis Data Streams**, otra **AWS Lambda** lo valida, lo limpia y lo carga en **Neo4j** (base de datos de grafos), y **Grafana** muestra el estado del pipeline y las analíticas.
 
 ---
 
@@ -36,6 +36,8 @@ Recibir un volumen grande de peticiones, procesarlas en streaming desde un tópi
 - Poder destruir y recrear el entorno en cada sesión sin dejar recursos.
 
 ## Arquitectura
+![Diagrama de arquitectura](docs/arquitectura.png)
+
 El juez (en el lab, `tests/producer.py` o `tests/load_test.py`) calcula las huellas del código para detectar plagio y manda cada envío a la API con el encabezado `x-api-key`. API Gateway revisa la key y el límite de tráfico del usage plan, e invoca la **Lambda de ingesta**, que publica el envío en Kinesis con el `user_id` como partition key. El Event Source Mapping de Lambda lee los shards e invoca la **Lambda procesadora** con lotes: valida y limpia cada registro y escribe el lote completo en Neo4j con `MERGE`, que es idempotente porque Kinesis entrega "al menos una vez". Los registros inválidos se reintentan y, si siguen fallando, el aviso termina en la DLQ. Neo4j y Grafana corren en Docker dentro de una EC2; Grafana lee las métricas de CloudWatch y consulta Neo4j.
 
 ```
@@ -150,6 +152,8 @@ AWS_5/
 │   ├── metrics.py             # Latencia, throughput, API Gateway, CloudWatch y DLQ de una corrida
 │   ├── queries.py             # Analíticas de grafo y detección de plagio con su recall
 │   └── results/               # (generado) resultados de cada corrida y experiments.csv
+├── docs/
+│   └── arquitectura.png       # Diagrama de arquitectura
 └── README.md
 ```
 
@@ -393,31 +397,38 @@ aws sqs get-queue-attributes --queue-url "$(terraform -chdir=../infra output -ra
 | Pasa el 7, Grafana vacío en el 8 | Retraso de CloudWatch (esperar) o `LabInstanceProfile` sin permisos |
 
 ## Resultados
-<!-- Agrega aquí tus capturas en docs/ (por ejemplo docs/grafana-pipeline.png, docs/load-test.png y docs/neo4j-grafo.png) y tus conclusiones -->
-
-### Corridas con el producer directo a Kinesis (antes de agregar la API)
-Datos sintéticos, `batch_size=100`, `parallelization_factor=1`, `lambda_memory=256`.
-
-| Corrida | Shards | Envíos | Tasa enviada | Throughput del pipeline | Latencia p50 / p95 | Concurrencia Lambda | Throttling Kinesis |
-|---|---|---|---|---|---|---|---|
-| `run-20261013-124002` | 1 | 5,102 | 298 ev/s | 185 ev/s | 11.1 s / 12.2 s | 1 | 0 |
-| `run-20261018-164414` | 1 | 5,102 | 298 ev/s | 201 ev/s | 9.5 s / 10.3 s | 1 | 0 |
-| `e2-shards2` | 2 | 20,000 | 1,598 ev/s | 402 ev/s | 27.8 s / 34.5 s | 2 | 0 |
-
-- **El throughput escala con los shards:** de unos 200 a unos 400 ev/s al pasar de 1 a 2 shards, porque hay una Lambda procesadora por shard.
-- **La latencia sube cuando se publica más rápido de lo que se procesa:** en `e2-shards2` se mandaron 1,600 ev/s contra unos 400 de capacidad, así que se formó cola (`IteratorAge` de 22 s). Para que no se degrade, la entrada debe limitarse a la capacidad; eso hace ahora el usage plan de la API.
-- **Casi todo el tiempo de la Lambda procesadora es escribir en Neo4j** (unos 400 ms por lote de 100). Calcular las huellas en el juez dejó la Lambda ligera.
-- **Plagio: 0 de 102 copias detectadas** en esas corridas. La causa era el generador sintético anterior y los k-gramas de 5 tokens; se corrigió (ver [Problemas conocidos](#problemas-conocidos)). Con el generador nuevo y `k = 12`, una simulación local de la misma consulta de `queries.py` dio **recall de 0.97 a 0.99 y 0 falsos positivos** con 20 mil envíos. Hay que confirmarlo en AWS con `queries.py` (E7).
+<!-- Agrega aquí tus capturas en docs/ y tus conclusiones -->
 
 ### Prueba de carga de la API
-<!-- Pega aquí la tabla que imprime load_test.py (results/load-<fecha>.csv) -->
+`load_test.py` con `shards=4`, `parallelization_factor=2`, un envío por petición y 60 s por escalón (`load-20261018-185114`).
 
-| Clientes | Peticiones/s | Envíos/s | p50 ms | p95 ms | p99 ms | % error | 429 | 5xx |
-|---|---|---|---|---|---|---|---|---|
-| 10 | | | | | | | | |
-| 25 | | | | | | | | |
-| 50 | | | | | | | | |
-| 100 | | | | | | | | |
+| Clientes | Peticiones/s | Envíos aceptados/s | p50 ms | p95 ms | p99 ms | % rechazadas (429) | 5xx |
+|---|---|---|---|---|---|---|---|
+| 10 | 106 | 106 | 90.9 | 104.0 | 182.9 | 0 % | 0 |
+| 25 | 270 | 270 | 89.1 | 102.2 | 165.4 | 0 % | 0 |
+| 50 | 547 | 509 | 89.7 | 103.3 | 160.4 | 6.8 % | 0 |
+| 100 | 1,266 | 507 | 91.8 | 110.1 | 173.5 | 60.0 % | 0 |
+
+- **La API no se degrada:** al pasar de 10 a 100 clientes, la p95 se mantuvo entre 102 y 110 ms y no hubo errores `5xx`.
+- **El usage plan protege al pipeline:** desde 50 clientes los envíos aceptados se estabilizan en unos 500/s, el `api_rate_limit`; lo que pasa de ahí se rechaza al instante con `429`.
+- **El cuello de botella es Neo4j:** en el escalón de 50 clientes, con 8 Lambdas procesadoras en paralelo (4 shards × 2), cada lote tardó en promedio 3.0 s en escribirse, `IteratorAge` llegó a 4 minutos y Kinesis no rechazó ninguna escritura. Para procesar todo lo que acepta la API, Neo4j necesitaría más recursos o el límite de la API tendría que bajar a su capacidad.
+
+### Corridas con el producer
+Datos sintéticos, `batch_size=100`, `parallelization_factor=1`, `lambda_memory=256`.
+
+| Corrida | Entrada | Shards | Envíos | Tasa enviada | Throughput procesado | Latencia p50 / p95 | Lambdas en paralelo |
+|---|---|---|---|---|---|---|---|
+| `run-20261013-124002` | Kinesis | 1 | 5,102 | 298 ev/s | 185 ev/s | 11.1 s / 12.2 s | 1 |
+| `run-20261018-164414` | Kinesis | 1 | 5,102 | 298 ev/s | 201 ev/s | 9.5 s / 10.3 s | 1 |
+| `e2-shards2` | Kinesis | 2 | 20,000 | 1,598 ev/s | 402 ev/s | 27.8 s / 34.5 s | 2 |
+| `run-20261018-183934` | API | 1 | 5,092 | 294 ev/s | 99 ev/s | 25.6 s / 34.3 s | 1 |
+
+- **El throughput escala con los shards:** de unos 200 a unos 400 envíos/s al pasar de 1 a 2 shards, porque hay una Lambda procesadora por shard.
+- **La latencia sube cuando se publica más rápido de lo que se procesa:** en `e2-shards2` se mandaron 1,600 ev/s contra unos 400 de capacidad, así que se formó cola.
+- **Por la API**, cada lote de 100 envíos se respondió en 120 ms en promedio (p95 de 199 ms), sin errores y con la DLQ vacía. El procesamiento fue más lento (99 ev/s) porque con el generador nuevo cada envío trae más huellas: cada lote tardó 876 ms en Neo4j, contra unos 400 ms antes.
+
+### Detección de plagio
+`queries.py` sobre la corrida `run-20261018-183934` (`--plagio 0.02`): de 92 copias inyectadas se detectaron las 92 (**recall de 1.0**) y **0 falsos positivos**. Aparecieron 133 parejas más, todas de la copia contra otros intentos del autor original, que también son plagio. La consulta tardó 11 s sobre unos 5,000 envíos.
 
 ### Dashboard del pipeline en Grafana
 | Panel | Métrica | Experimento |
@@ -524,7 +535,7 @@ rm -f terraform.tfstate.backup ~/.ssh/known_hosts.old
 | La API responde `403` con la key correcta | La key no está asociada al usage plan o el stage no está en el plan | Revisar `aws_api_gateway_usage_plan_key` y `api_stages` en `apigw.tf`, y volver a aplicar |
 | Muchos `429` en la prueba de carga | Se superó `api_rate_limit` / `api_burst_limit` del usage plan, o el límite de concurrencia de Lambda de la cuenta | Es el comportamiento esperado al pasar el límite. Para más throughput, subir los límites y los `shards`, o usar `--mode batch` |
 | `503` o `failed` en las respuestas de la API | Kinesis rechaza escrituras: cada envío pesa unos 3 KB y un shard acepta 1 MB/s (unos 340 envíos/s) | Subir `shards` según la tabla de [Capacidad del pipeline](#capacidad-del-pipeline); el producer reintenta solo los fallidos |
-| Recall de plagio en 0 | El generador sintético anterior salía de unas 24 líneas plantilla, y con k-gramas de 5 tokens casi todas las huellas se repetían entre programas distintos; el filtro de boilerplate (`--max-df`) las descartaba | Generador nuevo (`synthetic.py`, programas distintos por usuario) y `k = 12` por defecto en `fingerprint.py` |
+| Recall de plagio en 0 en las primeras corridas | El generador sintético anterior salía de unas 24 líneas plantilla, y con k-gramas de 5 tokens casi todas las huellas se repetían entre programas distintos; el filtro de boilerplate (`--max-df`) las descartaba | Generador nuevo (`synthetic.py`, programas distintos por usuario) y `k = 12` por defecto en `fingerprint.py` |
 | `UNPROTECTED PRIVATE KEY FILE` / `bad permissions` en Windows | El `.pem` hereda permisos de la carpeta y `file_permission` no aplica en NTFS | Provisioner que aplica `icacls` para dejar solo a tu usuario |
 | `Access is denied` al recrear el `.pem` | `file_permission = "0400"` lo marcaba como solo lectura en Windows | Usar `0600` y dar `(F)` a tu usuario con `icacls`. Si el `.pem` viejo sigue en solo lectura: `chmod u+w infra/judge-stream-key.pem` |
 | `Invalid -chdir option` | PowerShell parte `-chdir=../infra` en dos argumentos | Correr todo desde Git Bash (o poner el argumento entre comillas en PowerShell) |
