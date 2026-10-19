@@ -1,0 +1,11 @@
+# judge: el pipeline (Kafka, Neo4j, Kong, funciones de Knative, KafkaSource)
+# monitoring: Prometheus y Grafana
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${NAMESPACE}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring

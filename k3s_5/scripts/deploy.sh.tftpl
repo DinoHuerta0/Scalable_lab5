@@ -1,0 +1,205 @@
+#!/bin/bash
+# Despliega o actualiza el pipeline en k3s. Lo sube y lo corre Terraform por SSH
+# (infra/deploy.tf) cada vez que cambia una variable, src/ o k8s/. Es idempotente:
+# correrlo dos veces con los mismos valores no cambia nada.
+set -euo pipefail
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+export PATH=$PATH:/usr/local/bin
+LAB=/tmp/lab
+step() { echo; echo "== $*"; }
+
+# ---------------------------------------------------------------- 0. plataforma
+step "Esperando a que user_data instale k3s, Knative y Kafka (6-10 min la primera vez)"
+for i in $(seq 1 120); do
+  [ -f /var/lib/lab-bootstrap-done ] && break
+  # "running" o "not started": user_data sigue; cualquier otro estado (done, error) ya terminó
+  if ! cloud-init status 2>/dev/null | grep -qE "running|not started"; then break; fi
+  [ $((i % 6)) -eq 0 ] && echo "   ... $(tail -n 1 /var/log/bootstrap.log 2>/dev/null | cut -c1-120)"
+  sleep 10
+done
+if [ ! -f /var/lib/lab-bootstrap-done ]; then
+  echo "user_data no terminó bien. Últimas líneas de /var/log/bootstrap.log:" >&2
+  tail -n 40 /var/log/bootstrap.log >&2 || true
+  exit 1
+fi
+
+step "Esperando a que el nodo de datos (Kafka y Neo4j) se una al clúster"
+for i in $(seq 1 60); do
+  kubectl get nodes -l lab5/role=data --no-headers 2>/dev/null | grep -qw Ready && break
+  sleep 10
+done
+if ! kubectl get nodes -l lab5/role=data --no-headers 2>/dev/null | grep -qw Ready; then
+  echo "El nodo de datos no se unió en 10 minutos. Nodos del clúster:" >&2
+  kubectl get nodes -o wide >&2 || true
+  echo "Revisa /var/log/bootstrap.log en el nodo de datos (output ssh_command_data)" >&2
+  exit 1
+fi
+kubectl get nodes -L lab5/role
+
+# ---------------------------------------------------------------- reservas de CPU de la plataforma
+# Kubernetes solo programa un pod si la suma de lo que todos PIDEN (requests) cabe en el
+# nodo. Con los valores de fábrica, Knative reserva casi los 2 vCPU del servidor y el
+# despachador del KafkaSource pide 1 vCPU completo, así que los pods del pipeline se
+# quedaban en Pending. Se bajan las reservas (los límites no cambian) y el despachador,
+# que es el consumidor de Kafka, se va al nodo de datos. Recreate: en el servidor no
+# cabe un pod nuevo junto al viejo mientras se actualiza.
+step "Ajustando las reservas de CPU de Knative para dos t3.large"
+shrink() {   # namespace deployment cpu
+  kubectl -n "$1" patch deployment "$2" --type strategic \
+    -p '{"spec":{"strategy":{"type":"Recreate","rollingUpdate":null}}}' >/dev/null
+  kubectl -n "$1" set resources deployment "$2" --requests=cpu="$3"
+  kubectl -n "$1" rollout status deployment "$2" --timeout=300s
+}
+shrink knative-serving activator              100m
+shrink knative-serving net-kourier-controller 100m
+shrink kourier-system  3scale-kourier-gateway 100m
+
+kubectl -n knative-eventing patch statefulset kafka-source-dispatcher --type strategic -p '{
+  "spec": {"template": {"spec": {
+    "nodeSelector": {"lab5/role": "data"},
+    "tolerations": [{"key": "lab5/role", "operator": "Equal", "value": "data", "effect": "NoSchedule"}],
+    "containers": [{"name": "kafka-source-dispatcher",
+                    "resources": {"requests": {"cpu": "250m", "memory": "512Mi"}}}]
+  }}}}'
+
+# ---------------------------------------------------------------- parámetros (Terraform)
+export NAMESPACE="${namespace}"
+export IMAGE="${image}"
+export TOPIC="${topic}"
+export DLQ_TOPIC="${dlq_topic}"
+export CONSUMER_GROUP="${consumer_group}"
+export PARTITIONS="${partitions}"
+export CONSUMERS="${consumers}"
+export ORDERING="${ordering}"
+export MAX_POLL_RECORDS="${max_poll_records}"
+export BATCH_SIZE="${batch_size}"
+export BATCHING_WINDOW_MS="${batching_window_ms}"
+export PROCESSOR_MEMORY="${processor_memory}"
+export PROCESSOR_CONCURRENCY="${processor_concurrency}"
+export PROCESSOR_THREADS="${processor_threads}"
+export PROCESSOR_MIN_SCALE="${processor_min_scale}"
+export PROCESSOR_MAX_SCALE="${processor_max_scale}"
+export INGEST_MEMORY="${ingest_memory}"
+export INGEST_MAX_SCALE="${ingest_max_scale}"
+export KAFKA_IMAGE="${kafka_image}"
+export KONG_IMAGE="${kong_image}"
+export KONG_CONFIG_SHA="${kong_config_sha}"
+export NEO4J_IMAGE="${neo4j_image}"
+export NEO4J_HEAP="${neo4j_heap}"
+export NEO4J_PAGECACHE="${neo4j_pagecache}"
+export GRAFANA_IMAGE="${grafana_image}"
+export GRAFANA_NEO4J_PLUGIN="${grafana_neo4j_plugin}"
+export PROMETHEUS_IMAGE="${prometheus_image}"
+export KAFKA_EXPORTER_IMAGE="${kafka_exporter_image}"
+
+# Solo estas variables se reemplazan en k8s/*.yaml (el resto de los $ se queda igual)
+VARS='$NAMESPACE $IMAGE $TOPIC $DLQ_TOPIC $CONSUMER_GROUP $CONSUMERS $ORDERING
+$BATCH_SIZE $BATCHING_WINDOW_MS $PROCESSOR_MEMORY $PROCESSOR_CONCURRENCY $PROCESSOR_THREADS
+$PROCESSOR_MIN_SCALE $PROCESSOR_MAX_SCALE $INGEST_MEMORY $INGEST_MAX_SCALE $KAFKA_IMAGE
+$KONG_IMAGE $KONG_CONFIG_SHA $NEO4J_IMAGE $NEO4J_HEAP $NEO4J_PAGECACHE $GRAFANA_IMAGE
+$GRAFANA_NEO4J_PLUGIN $PROMETHEUS_IMAGE $KAFKA_EXPORTER_IMAGE'
+
+apply() {
+  for f in "$@"; do
+    envsubst "$VARS" < "$LAB/k8s/$f" | kubectl apply -f -
+  done
+}
+
+# ---------------------------------------------------------------- 1. imagen de las funciones
+step "Imagen $IMAGE"
+if k3s ctr images ls -q | grep -qx "$IMAGE"; then
+  echo "   ya existe (src/ no cambió)"
+else
+  docker build -q -t "$IMAGE" "$LAB/src"
+  docker save "$IMAGE" | k3s ctr images import -
+fi
+
+# ---------------------------------------------------------------- 2. namespaces y secretos
+step "Namespaces, secretos y configuración"
+apply namespaces.yaml
+kubectl -n "$NAMESPACE" create secret generic neo4j-auth \
+  --from-literal=NEO4J_AUTH='neo4j/${neo4j_password}' \
+  --from-literal=password='${neo4j_password}' \
+  --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n monitoring create secret generic grafana-admin \
+  --from-literal=password='${grafana_password}' \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+# Configuración declarativa de Kong (la arma Terraform en infra/kong.tf)
+echo '${kong_config_b64}' | base64 -d > /tmp/kong.yml
+kubectl -n "$NAMESPACE" create configmap kong-config --from-file=kong.yml=/tmp/kong.yml \
+  --dry-run=client -o yaml | kubectl apply -f -
+rm -f /tmp/kong.yml
+
+# Dashboard del pipeline (lo arma Terraform en infra/grafana.tf)
+echo '${dashboard_b64}' | base64 -d | gunzip > /tmp/pipeline.json
+kubectl -n monitoring create configmap grafana-dashboards --from-file=pipeline.json=/tmp/pipeline.json \
+  --dry-run=client -o yaml | kubectl apply -f -
+rm -f /tmp/pipeline.json
+
+# ---------------------------------------------------------------- 3. Kafka y Neo4j
+step "Kafka y Neo4j"
+apply kafka.yaml neo4j.yaml
+kubectl -n "$NAMESPACE" rollout status statefulset/kafka --timeout=600s
+kubectl -n "$NAMESPACE" rollout status statefulset/neo4j --timeout=600s
+
+# ---------------------------------------------------------------- 4. tópicos
+step "Tópicos ($TOPIC con $PARTITIONS particiones y $DLQ_TOPIC)"
+kafka() { kubectl -n "$NAMESPACE" exec kafka-0 -- "/opt/kafka/bin/$1" --bootstrap-server localhost:9092 "$${@:2}"; }
+until kafka kafka-topics.sh --list >/dev/null 2>&1; do echo "   esperando al broker..."; sleep 5; done
+
+current=$(kafka kafka-topics.sh --describe --topic "$TOPIC" 2>/dev/null \
+  | grep -o 'PartitionCount: *[0-9]*' | grep -o '[0-9]*' || true)
+if [ -n "$current" ] && [ "$current" != "$PARTITIONS" ]; then
+  echo "   particiones $current -> $PARTITIONS: se recrea el tópico (como cambiar shards en Kinesis)"
+  kubectl -n "$NAMESPACE" delete kafkasource submissions --ignore-not-found --wait=true
+  kafka kafka-topics.sh --delete --topic "$TOPIC"
+  while kafka kafka-topics.sh --list | grep -qx "$TOPIC"; do sleep 2; done
+  # Sin consumidores el grupo queda vacío; se borra para que empiece desde el principio
+  for i in $(seq 1 12); do
+    kafka kafka-consumer-groups.sh --delete --group "$CONSUMER_GROUP" >/dev/null 2>&1 && break
+    sleep 5
+  done
+fi
+kafka kafka-topics.sh --create --if-not-exists --topic "$TOPIC" \
+  --partitions "$PARTITIONS" --replication-factor 1
+kafka kafka-topics.sh --create --if-not-exists --topic "$DLQ_TOPIC" \
+  --partitions 1 --replication-factor 1
+
+# ---------------------------------------------------------------- 5. despachador del KafkaSource
+step "Despachador del KafkaSource (max.poll.records=$MAX_POLL_RECORDS)"
+CM=config-kafka-source-data-plane
+props=$(kubectl -n knative-eventing get cm "$CM" -o jsonpath='{.data.config-kafka-source-consumer\.properties}')
+now=$(echo "$props" | grep '^max.poll.records=' | cut -d= -f2)
+if [ "$now" != "$MAX_POLL_RECORDS" ]; then
+  kubectl -n knative-eventing get cm "$CM" -o json \
+    | sed "s/max\.poll\.records=[0-9]*/max.poll.records=$MAX_POLL_RECORDS/" \
+    | kubectl replace -f -
+  kubectl -n knative-eventing rollout restart statefulset/kafka-source-dispatcher 2>/dev/null || true
+  echo "   $now -> $MAX_POLL_RECORDS"
+else
+  echo "   sin cambios"
+fi
+
+# ---------------------------------------------------------------- 6. funciones, Kong y monitoreo
+step "Funciones de Knative, Kong, Prometheus y Grafana"
+apply ingest.yaml processor.yaml kong.yaml kafka-exporter.yaml prometheus.yaml grafana.yaml
+kubectl -n "$NAMESPACE" wait ksvc/ingest ksvc/processor --for=condition=Ready --timeout=600s
+
+step "KafkaSource y DLQ"
+apply kafka-source.yaml
+kubectl -n "$NAMESPACE" wait kafkasink/dlq kafkasource/submissions --for=condition=Ready --timeout=600s
+
+kubectl -n "$NAMESPACE" rollout status deployment/kong --timeout=300s
+kubectl -n "$NAMESPACE" rollout status deployment/kafka-exporter --timeout=300s
+kubectl -n monitoring rollout status deployment/prometheus --timeout=300s
+kubectl -n monitoring rollout status deployment/grafana --timeout=300s
+
+# ---------------------------------------------------------------- 7. prueba de humo
+step "Prueba de humo"
+code=$(curl -s -o /dev/null -w '%%{http_code}' -X POST http://localhost/submissions -d '{}' || true)
+echo "   POST /submissions sin API key -> $code (esperado: 401)"
+
+rm -f "$LAB/deploy.sh"   # contiene contraseñas
+step "Pipeline listo"
+kubectl -n "$NAMESPACE" get ksvc,kafkasource,kafkasink

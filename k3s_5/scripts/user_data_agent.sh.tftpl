@@ -1,0 +1,13 @@
+#!/bin/bash
+# Nodo de DATOS (Amazon Linux 2023): instala k3s como agente y se une al servidor.
+#  - Etiqueta lab5/role=data: Kafka y Neo4j la usan como nodeSelector.
+#  - Taint lab5/role=data:NoSchedule: ningún otro pod se programa aquí, así Kafka y
+#    Neo4j tienen la CPU y la memoria del nodo para ellos solos.
+# El agente reintenta solo hasta que el servidor responde en el puerto 6443.
+set -euo pipefail
+exec > /var/log/bootstrap.log 2>&1
+
+curl -sfL https://get.k3s.io | K3S_URL="https://${server_ip}:6443" K3S_TOKEN='${k3s_token}' \
+  INSTALL_K3S_EXEC="agent --node-label lab5/role=data --node-taint lab5/role=data:NoSchedule" sh -
+
+echo "AGENT OK"

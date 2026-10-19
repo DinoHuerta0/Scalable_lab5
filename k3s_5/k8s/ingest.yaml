@@ -1,0 +1,36 @@
+# Función de ingesta (equivale a la Lambda de ingesta): Kong -> Kafka.
+# cluster-local: solo se llega por la red interna (Kong la llama como
+# http://ingest.${NAMESPACE}.svc.cluster.local).
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: ingest
+  namespace: ${NAMESPACE}
+  labels:
+    networking.knative.dev/visibility: cluster-local
+spec:
+  template:
+    metadata:
+      labels:
+        app: ingest
+      annotations:
+        autoscaling.knative.dev/min-scale: "1"   # la API no paga arranques en frío
+        autoscaling.knative.dev/max-scale: "${INGEST_MAX_SCALE}"
+        autoscaling.knative.dev/target: "50"     # peticiones simultáneas por pod
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+    spec:
+      enableServiceLinks: false
+      containers:
+        - image: ${IMAGE}
+          imagePullPolicy: IfNotPresent
+          command: ["gunicorn", "--bind", ":8080", "--workers", "1", "--threads", "32",
+                    "--timeout", "30", "ingest:app"]
+          ports:
+            - containerPort: 8080
+          env:
+            - { name: BOOTSTRAP_SERVERS, value: "kafka.${NAMESPACE}.svc.cluster.local:9092" }
+            - { name: TOPIC, value: "${TOPIC}" }
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { memory: "${INGEST_MEMORY}Mi" }

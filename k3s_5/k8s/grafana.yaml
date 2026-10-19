@@ -1,0 +1,100 @@
+# Grafana con Prometheus ya configurado y el dashboard del pipeline (carpeta Lab 5).
+# El dashboard está en el ConfigMap grafana-dashboards, que arma Terraform en
+# infra/grafana.tf; Grafana lo vuelve a leer solo cuando cambia. Puerto 3000 del nodo.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-provisioning
+  namespace: monitoring
+data:
+  datasources.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        uid: prometheus
+        isDefault: true
+        access: proxy
+        url: http://prometheus.monitoring.svc.cluster.local:9090
+        jsonData:
+          timeInterval: 5s
+  dashboards.yaml: |
+    apiVersion: 1
+    providers:
+      - name: lab5
+        folder: Lab 5
+        type: file
+        updateIntervalSeconds: 30
+        options:
+          path: /var/lib/grafana/dashboards
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      # En el nodo de datos: el servidor ya está lleno con Knative (ver deploy.sh)
+      nodeSelector:
+        lab5/role: data
+      tolerations:
+        - { key: lab5/role, operator: Equal, value: data, effect: NoSchedule }
+      containers:
+        - name: grafana
+          image: ${GRAFANA_IMAGE}
+          ports:
+            - containerPort: 3000
+          env:
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: grafana-admin, key: password }
+            - { name: GF_INSTALL_PLUGINS, value: "${GRAFANA_NEO4J_PLUGIN}" }
+            - { name: GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS, value: "${GRAFANA_NEO4J_PLUGIN}" }
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 3000
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { memory: 512Mi }
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/grafana
+            - name: provisioning
+              mountPath: /etc/grafana/provisioning/datasources/datasources.yaml
+              subPath: datasources.yaml
+            - name: provisioning
+              mountPath: /etc/grafana/provisioning/dashboards/dashboards.yaml
+              subPath: dashboards.yaml
+            - name: dashboards
+              mountPath: /var/lib/grafana/dashboards
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: provisioning
+          configMap:
+            name: grafana-provisioning
+        - name: dashboards
+          configMap:
+            name: grafana-dashboards
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: monitoring
+spec:
+  type: LoadBalancer   # puerto 3000 del nodo
+  selector:
+    app: grafana
+  ports:
+    - port: 3000

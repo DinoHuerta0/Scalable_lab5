@@ -1,0 +1,35 @@
+# kafka-exporter: offsets por partición y lag del grupo de consumidores, para
+# Prometheus (equivale a IncomingRecords e IteratorAge de CloudWatch).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka-exporter
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kafka-exporter
+  template:
+    metadata:
+      labels:
+        app: kafka-exporter
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9308"
+    spec:
+      # En el nodo de datos: el servidor ya está lleno con Knative (ver deploy.sh)
+      nodeSelector:
+        lab5/role: data
+      tolerations:
+        - { key: lab5/role, operator: Equal, value: data, effect: NoSchedule }
+      containers:
+        - name: kafka-exporter
+          image: ${KAFKA_EXPORTER_IMAGE}
+          args:
+            - --kafka.server=kafka.${NAMESPACE}.svc.cluster.local:9092
+          ports:
+            - containerPort: 9308
+          resources:
+            requests: { cpu: 50m, memory: 32Mi }
+            limits: { memory: 128Mi }

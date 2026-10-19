@@ -43,35 +43,43 @@ Servicios administrados de AWS para la entrada, el tópico y el procesamiento; *
 - Otra **AWS Lambda**, conectada con un Event Source Mapping, solo valida, limpia y carga en Neo4j. Lo que falla de forma repetida va a una **DLQ (SQS)**.
 - **Grafana** trae ya configurado el dashboard del pipeline (API Gateway, Kinesis, Lambdas y DLQ en CloudWatch) y se conecta a Neo4j para las analíticas.
 
-### 2. `k3s_5`
-En desarrollo.
+### 2. [`k3s_5`](./k3s_5): Kong + Kafka + Knative + Neo4j + Grafana en k3s
+El mismo pipeline solo con software open source, en un clúster de **k3s** de dos nodos `t3.large`: uno para las aplicaciones y otro para Kafka y Neo4j.
+
+- **Kong** reemplaza a API Gateway: exige la API key en `x-api-key` y responde `429` si se pasa el límite.
+- Una función de **Knative** publica cada envío en **Apache Kafka**, con `user_id` como llave.
+- Un **KafkaSource** de Knative Eventing entrega cada registro a otra función de Knative, que junta los eventos en lotes, los valida, los limpia y los carga en Neo4j. Lo que falla de forma repetida va a un tópico DLQ.
+- **Prometheus** reemplaza a CloudWatch, y **Grafana** trae ya configurado el dashboard del pipeline (Kong, Kafka, funciones y DLQ).
 
 > Cada carpeta tiene su propio `README.md` con arquitectura, despliegue, verificación y problemas conocidos.
 
 ## Comparación
 | Aspecto | `AWS_5` | `k3s_5` |
 |---------|---------|---------|
-| Enfoque | Servicios administrados de AWS | |
-| Entrada | API Gateway REST con API key y usage plan | |
-| Tópico | Kinesis Data Streams (1 a 4 shards) | |
-| Procesamiento | Lambda de ingesta + Lambda procesadora con Event Source Mapping | |
-| Base de datos | Neo4j 5 en Docker sobre EC2 | |
-| Visualización | Grafana con CloudWatch y Neo4j | |
-| Cómo entra un envío | `POST /submissions` con `x-api-key` | |
-| Tipo de instancia / recursos | 2 Lambdas de 256 MB, EC2 `t3.medium` | |
-| Puertos abiertos (solo tu IP) | 22, 3000, 7474, 7687 | |
-| Tiempo hasta estar listo | 3 a 5 minutos | |
-| Complejidad | Media | |
+| Enfoque | Servicios administrados de AWS | Open source sobre k3s |
+| Entrada | API Gateway REST con API key y usage plan | Kong con `key-auth` y `rate-limiting` |
+| Tópico | Kinesis Data Streams (1 a 4 shards) | Apache Kafka 3.8 en KRaft (N particiones) |
+| Procesamiento | Lambda de ingesta + Lambda procesadora con Event Source Mapping | Knative Service de ingesta + KafkaSource + Knative Service procesador |
+| Entrega al procesador | Lotes de hasta `batch_size` | Un evento por petición; la procesadora arma los lotes |
+| DLQ | SQS (metadatos del lote fallido) | Tópico de Kafka con el evento completo (KafkaSink) |
+| Base de datos | Neo4j 5 en Docker sobre EC2 | Neo4j 5 como pod en k3s |
+| Visualización | Grafana con CloudWatch y Neo4j | Grafana con Prometheus y Neo4j |
+| Cómo entra un envío | `POST /submissions` con `x-api-key` | Igual (sin key responde `401` en vez de `403`) |
+| Tipo de instancia / recursos | 2 Lambdas de 256 MB, EC2 `t3.medium` | Dos EC2 `t3.large` (2 vCPU y 8 GB cada una): aplicaciones y datos |
+| Puertos abiertos (solo tu IP) | 22, 3000, 7474, 7687 | 22, 80, 3000, 7474, 7687, 9090 |
+| Tiempo hasta estar listo | 3 a 5 minutos | 10 a 15 minutos (1 o 2 al cambiar una variable) |
+| Complejidad | Media | Alta |
 
 **Cuándo conviene cada uno:**
 - `AWS_5`: cuando no se quiere operar el broker ni los consumidores y el tráfico es variable. Lambda escala por shard y se paga por uso.
+- `k3s_5`: cuando se quiere evitar la dependencia de un proveedor o correr el mismo pipeline en cualquier nube o en servidores propios. Se paga una instancia fija y se opera todo (Kafka, Neo4j, Knative), pero cada pieza se puede ajustar.
 
 ## Requisitos generales
 Los requisitos específicos están en el README de cada carpeta.
 
 - [Terraform](https://developer.hashicorp.com/terraform/downloads) >= 1.5.
 - [AWS CLI](https://aws.amazon.com/cli/) con el perfil `academy` (`aws sts get-caller-identity --profile academy`). En `AWS_5`, Terraform lo usa para crear el stream.
-- Python 3.10 o superior con boto3 (`pip install -r AWS_5/tests/requirements.txt`).
+- Python 3.10 o superior. En `AWS_5`, con boto3 (`pip install -r AWS_5/tests/requirements.txt`); en `k3s_5` no hace falta instalar nada.
 - **Bash**: en Windows, [Git Bash](https://git-scm.com/downloads); en Linux o Mac, la terminal normal.
 - En Windows, **corre Terraform desde Git Bash**, no desde PowerShell ni CMD, para que `bash` apunte al de Git y no al de WSL.
 
@@ -85,7 +93,13 @@ Lab_5/
 │   ├── tests/         # Juez simulado, prueba de carga, métricas, consultas y Neo4j
 │   ├── docs/          # Diagrama de arquitectura
 │   └── README.md
-├── k3s_5/             # En desarrollo
+├── k3s_5/             # Kong + Kafka + Knative + Neo4j + Grafana en k3s
+│   ├── infra/         # Terraform (aquí se corren los comandos)
+│   ├── k8s/           # Manifiestos de Kubernetes (Kafka, Neo4j, Kong, funciones, monitoreo)
+│   ├── scripts/       # user_data del servidor y del nodo de datos, y deploy.sh (pipeline, por SSH)
+│   ├── src/           # Código de las funciones de Knative (ingesta y procesadora)
+│   ├── tests/         # Los mismos scripts de prueba que AWS_5
+│   └── README.md
 ├── .gitattributes     # Finales de línea LF para los scripts que corren en Linux
 ├── .gitignore
 └── README.md          # Este archivo
@@ -95,7 +109,7 @@ Lab_5/
 Entra a la carpeta `infra/` del proyecto que quieras desplegar:
 
 ```bash
-cd AWS_5/infra
+cd AWS_5/infra   # o k3s_5/infra
 terraform init
 terraform apply
 ```
@@ -111,7 +125,9 @@ python queries.py
 python load_test.py --steps 10,25,50,100 --duration 60
 ```
 
-Para conectarte por SSH a la EC2 de Neo4j y Grafana, desde `infra/`:
+En `k3s_5`, cuando `terraform apply` termina el pipeline ya responde; `python db.py wait` regresa de inmediato.
+
+Para conectarte por SSH a la EC2, desde `infra/`:
 
 ```bash
 eval "$(terraform output -raw ssh_command)"
@@ -124,7 +140,7 @@ Al terminar cada sesión, desde la carpeta `infra/` del proyecto desplegado:
 terraform destroy
 ```
 
-Esto borra la API Gateway, las Lambdas, el stream, la DLQ, la instancia, los Security Groups, el Key Pair y el `.pem` local, y elimina la huella de la IP en `~/.ssh/known_hosts`. En `AWS_5`, el Security Group de la Lambda tarda 20 a 40 minutos en borrarse; si `destroy` falla en ese recurso, espera y repítelo.
+Esto borra la API Gateway, las Lambdas, el stream, la DLQ, la instancia, los Security Groups, el Key Pair y el `.pem` local, y elimina la huella de la IP en `~/.ssh/known_hosts`. En `AWS_5`, el Security Group de la Lambda tarda 20 a 40 minutos en borrarse; si `destroy` falla en ese recurso, espera y repítelo. En `k3s_5` todo vive dentro de las dos EC2, así que `destroy` tarda 1 o 2 minutos.
 
 ## Conclusiones
 <!-- Ajusta con tus propias observaciones -->
@@ -134,6 +150,7 @@ Esto borra la API Gateway, las Lambdas, el stream, la DLQ, la instancia, los Sec
 - **El cuello de botella es Neo4j en una sola `t3.medium`:** con 8 Lambdas escribiendo en paralelo (4 shards × 2), cada lote tardó unos 3 s en escribirse y el atraso del consumidor llegó a 4 minutos. Para crecer habría que ajustar el límite de la API a lo que procesa la base de datos o darle más recursos.
 - **Kinesis entrega "al menos una vez"**, así que escribir con `MERGE` sobre llaves únicas hace la carga idempotente sin lógica extra.
 - **La detección de plagio funcionó:** con programas distintos por usuario y huellas de 12 tokens, se detectaron las 92 copias inyectadas (recall de 1.0) sin falsos positivos.
+<!-- k3s_5: agrega aquí la comparación con AWS_5 cuando tengas sus corridas -->
 - **Las restricciones de AWS Academy cambian el diseño:** sin Neptune ni Managed Grafana se usaron Neo4j y Grafana en una EC2, y el bloqueo de `IncreaseStreamRetentionPeriod` obligó a crear el stream con el AWS CLI.
 
 ## Referencias

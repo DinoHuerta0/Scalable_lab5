@@ -1,0 +1,48 @@
+# KafkaSource (Knative Eventing): equivale al Event Source Mapping de Lambda.
+# Lee el tópico con el grupo ${CONSUMER_GROUP} y manda cada registro a la procesadora
+# como un CloudEvent por HTTP. Si la procesadora responde error, reintenta con backoff
+# exponencial; si se agotan los reintentos (o el evento es inválido, 400), lo manda al
+# KafkaSink "dlq", que lo escribe en el tópico ${DLQ_TOPIC}.
+#
+# ordering:
+#   ordered    un evento a la vez por partición, en orden (como Lambda por shard)
+#   unordered  varios eventos en vuelo por partición (hasta max.poll.records)
+apiVersion: eventing.knative.dev/v1alpha1
+kind: KafkaSink
+metadata:
+  name: dlq
+  namespace: ${NAMESPACE}
+spec:
+  topic: ${DLQ_TOPIC}
+  bootstrapServers:
+    - kafka.${NAMESPACE}.svc.cluster.local:9092
+  contentMode: binary   # el valor del registro es el evento original, sin envoltura
+---
+apiVersion: sources.knative.dev/v1beta1
+kind: KafkaSource
+metadata:
+  name: submissions
+  namespace: ${NAMESPACE}
+spec:
+  ordering: ${ORDERING}
+  consumerGroup: ${CONSUMER_GROUP}
+  bootstrapServers:
+    - kafka.${NAMESPACE}.svc.cluster.local:9092
+  topics:
+    - ${TOPIC}
+  initialOffset: earliest   # como TRIM_HORIZON en Kinesis
+  consumers: ${CONSUMERS}
+  delivery:
+    retry: 3
+    backoffPolicy: exponential
+    backoffDelay: PT0.5S
+    deadLetterSink:
+      ref:
+        apiVersion: eventing.knative.dev/v1alpha1
+        kind: KafkaSink
+        name: dlq
+  sink:
+    ref:
+      apiVersion: serving.knative.dev/v1
+      kind: Service
+      name: processor

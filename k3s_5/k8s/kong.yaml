@@ -1,0 +1,67 @@
+# Kong Gateway sin base de datos: la entrada del juez (equivale a API Gateway).
+# La configuración (API key, límites y rutas) está en el ConfigMap kong-config, que
+# arma Terraform en infra/kong.tf. La anotación checksum reinicia Kong si cambia.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kong
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 1   # el rate-limiting "local" cuenta por pod: con 1 réplica el límite es exacto
+  selector:
+    matchLabels:
+      app: kong
+  template:
+    metadata:
+      labels:
+        app: kong
+      annotations:
+        checksum/config: "${KONG_CONFIG_SHA}"
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8100"
+    spec:
+      containers:
+        - name: kong
+          image: ${KONG_IMAGE}
+          ports:
+            - { name: proxy, containerPort: 8000 }
+            - { name: status, containerPort: 8100 }
+          env:
+            - { name: KONG_DATABASE, value: "off" }
+            - { name: KONG_DECLARATIVE_CONFIG, value: /kong/kong.yml }
+            - { name: KONG_PROXY_LISTEN, value: "0.0.0.0:8000" }
+            - { name: KONG_ADMIN_LISTEN, value: "off" }
+            - { name: KONG_STATUS_LISTEN, value: "0.0.0.0:8100" }   # /status/ready y /metrics
+            - { name: KONG_NGINX_WORKER_PROCESSES, value: "2" }
+            - { name: KONG_PROXY_ACCESS_LOG, value: "off" }
+            - { name: KONG_PROXY_ERROR_LOG, value: /dev/stderr }
+            - { name: KONG_DNS_ORDER, value: "LAST,A,CNAME" }
+          readinessProbe:
+            httpGet:
+              path: /status/ready
+              port: 8100
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 512Mi }
+          volumeMounts:
+            - name: config
+              mountPath: /kong
+      volumes:
+        - name: config
+          configMap:
+            name: kong-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kong-proxy
+  namespace: ${NAMESPACE}
+spec:
+  type: LoadBalancer   # puerto 80 del nodo
+  selector:
+    app: kong
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8000

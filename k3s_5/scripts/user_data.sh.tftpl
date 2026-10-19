@@ -1,0 +1,96 @@
+#!/bin/bash
+# Instala la plataforma en el SERVIDOR de k3s (Amazon Linux 2023): Docker, k3s server,
+# Knative Serving con Kourier, Knative Eventing y el soporte de Kafka (KafkaSource y
+# KafkaSink). El nodo de datos se une solo (scripts/user_data_agent.sh.tftpl).
+# El pipeline (Kafka, Neo4j, Kong, funciones, Prometheus y Grafana) lo despliega
+# después Terraform por SSH con scripts/deploy.sh.tftpl.
+set -euxo pipefail
+exec > /var/log/bootstrap.log 2>&1
+
+KV="${knative_version}"
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+export PATH=$PATH:/usr/local/bin
+
+# ---------------------------------------------------------------- Docker
+# Solo para construir la imagen de las funciones; k3s usa su propio containerd.
+# gettext trae envsubst, que deploy.sh usa para llenar los manifiestos de k8s/.
+dnf install -y docker gettext
+systemctl enable --now docker
+
+# ---------------------------------------------------------------- k3s
+# Sin Traefik: el puerto 80 es de Kong. El token es el que usa el agente para unirse
+# (set +x para que no quede escrito en el log).
+set +x
+curl -sfL https://get.k3s.io | K3S_TOKEN='${k3s_token}' \
+  INSTALL_K3S_EXEC="server --disable traefik --write-kubeconfig-mode 644 --node-label lab5/role=apps" sh -
+set -x
+until kubectl get nodes 2>/dev/null | grep -q " Ready"; do sleep 5; done
+
+# kubectl apply con reintentos: cubre descargas fallidas y webhooks que aún arrancan
+apply_url() {
+  for i in $(seq 1 30); do
+    kubectl apply -f "$1" && return 0
+    sleep 10
+  done
+  return 1
+}
+
+# Espera a que todos los Deployments de un namespace estén disponibles
+wait_ns() {
+  kubectl -n "$1" wait --for=condition=Available deploy --all --timeout=900s
+}
+
+# Los webhooks de Knative llenan sus reglas cuando su pod arranca; antes de eso, lo que
+# dependa de ellos falla (por ejemplo, el despachador del KafkaSource necesita que
+# kafka-webhook-eventing le agregue el volumen contract-resources)
+wait_webhook_rules() {
+  for i in $(seq 1 90); do
+    [ -n "$(kubectl get mutatingwebhookconfiguration "$1" -o jsonpath='{.webhooks[0].rules}' 2>/dev/null)" ] && return 0
+    sleep 10
+  done
+  echo "El webhook $1 no se configuró a tiempo" >&2
+  return 1
+}
+
+# ---------------------------------------------------------------- Knative Serving + Kourier
+apply_url "https://github.com/knative/serving/releases/download/$KV/serving-crds.yaml"
+kubectl wait --for=condition=Established crd --all --timeout=180s
+apply_url "https://github.com/knative/serving/releases/download/$KV/serving-core.yaml"
+wait_ns knative-serving
+
+# Kourier solo como red interna de Knative: su Service pasa de LoadBalancer a ClusterIP
+# para no ocupar el puerto 80 del nodo. Kong llega a las funciones por kourier-internal.
+curl -sSfL --retry 5 "https://github.com/knative/net-kourier/releases/download/$KV/kourier.yaml" \
+  | sed 's/type: LoadBalancer/type: ClusterIP/' > /tmp/kourier.yaml
+apply_url /tmp/kourier.yaml
+kubectl patch configmap/config-network -n knative-serving --type merge \
+  -p '{"data":{"ingress-class":"kourier.ingress.networking.knative.dev"}}'
+wait_ns kourier-system
+
+# ---------------------------------------------------------------- Knative Eventing
+apply_url "https://github.com/knative/eventing/releases/download/$KV/eventing-crds.yaml"
+kubectl wait --for=condition=Established crd --all --timeout=180s
+apply_url "https://github.com/knative/eventing/releases/download/$KV/eventing-core.yaml"
+wait_ns knative-eventing
+
+# ---------------------------------------------------------------- Kafka (controlador, KafkaSource, KafkaSink)
+# Primero el controlador y su webhook; el KafkaSource y el KafkaSink se instalan
+# hasta que el webhook está corriendo y con sus reglas listas.
+apply_url "https://github.com/knative-extensions/eventing-kafka-broker/releases/download/$KV/eventing-kafka-controller.yaml"
+kubectl wait --for=condition=Established crd --all --timeout=180s
+wait_ns knative-eventing
+wait_webhook_rules pods.defaulting.webhook.kafka.eventing.knative.dev
+# El StatefulSet del despachador monta un volumen "contract-resources" que el manifiesto
+# no define: el webhook de Kafka lo sustituye en cada pod por el ConfigMap de ese pod.
+# Kubernetes valida el StatefulSet antes de que exista un pod y lo rechaza
+# ("volumeMounts[1].name: Not found"), así que se agrega un volumen vacío con ese
+# nombre, que el webhook reemplaza (issues #3995 y #4119 de eventing-kafka-broker).
+curl -sSfL --retry 5 "https://github.com/knative-extensions/eventing-kafka-broker/releases/download/$KV/eventing-kafka-source.yaml" \
+  | sed '0,/^      volumes:$/s//      volumes:\n        - name: contract-resources\n          emptyDir: {}/' > /tmp/eventing-kafka-source.yaml
+grep -q "name: contract-resources" /tmp/eventing-kafka-source.yaml
+apply_url /tmp/eventing-kafka-source.yaml
+apply_url "https://github.com/knative-extensions/eventing-kafka-broker/releases/download/$KV/eventing-kafka-sink.yaml"
+wait_ns knative-eventing
+
+touch /var/lib/lab-bootstrap-done
+echo "BOOTSTRAP OK"

@@ -1,0 +1,75 @@
+# Neo4j Community: la base de grafos. LoadBalancer = puertos 7474 y 7687 del nodo
+# (el Security Group solo los abre a tu IP). La procesadora escribe por la API HTTP
+# en neo4j.${NAMESPACE}.svc.cluster.local:7474.
+apiVersion: v1
+kind: Service
+metadata:
+  name: neo4j
+  namespace: ${NAMESPACE}
+spec:
+  type: LoadBalancer
+  selector:
+    app: neo4j
+  ports:
+    - { name: http, port: 7474 }
+    - { name: bolt, port: 7687 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: neo4j
+  namespace: ${NAMESPACE}
+spec:
+  serviceName: neo4j
+  replicas: 1
+  selector:
+    matchLabels:
+      app: neo4j
+  template:
+    metadata:
+      labels:
+        app: neo4j
+    spec:
+      # Sin esto, Kubernetes inyecta NEO4J_PORT, NEO4J_SERVICE_HOST... y la imagen las
+      # interpreta como configuración inválida
+      # Solo en el nodo de datos (ver infra/k3s.tf): su disco local-path queda ahí
+      nodeSelector:
+        lab5/role: data
+      tolerations:
+        - { key: lab5/role, operator: Equal, value: data, effect: NoSchedule }
+      enableServiceLinks: false
+      containers:
+        - name: neo4j
+          image: ${NEO4J_IMAGE}
+          ports:
+            - containerPort: 7474
+            - containerPort: 7687
+          env:
+            - name: NEO4J_AUTH
+              valueFrom:
+                secretKeyRef: { name: neo4j-auth, key: NEO4J_AUTH }
+            - { name: NEO4J_server_memory_heap_initial__size, value: "${NEO4J_HEAP}" }
+            - { name: NEO4J_server_memory_heap_max__size, value: "${NEO4J_HEAP}" }
+            - { name: NEO4J_server_memory_pagecache_size, value: "${NEO4J_PAGECACHE}" }
+            - { name: NEO4J_db_transaction_timeout, value: "60s" }
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 7474
+            initialDelaySeconds: 20
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 500m, memory: 4Gi }
+            limits: { memory: 5Gi }
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 10Gi

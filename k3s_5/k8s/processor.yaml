@@ -1,0 +1,43 @@
+# Función procesadora (equivale a la Lambda procesadora). La invoca el KafkaSource con
+# un evento por petición; ella junta los eventos que llegan juntos y los escribe en
+# Neo4j por lotes de hasta BATCH_SIZE. Escala a cero cuando no hay tráfico.
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: processor
+  namespace: ${NAMESPACE}
+  labels:
+    networking.knative.dev/visibility: cluster-local
+spec:
+  template:
+    metadata:
+      labels:
+        app: processor
+      annotations:
+        autoscaling.knative.dev/min-scale: "${PROCESSOR_MIN_SCALE}"
+        autoscaling.knative.dev/max-scale: "${PROCESSOR_MAX_SCALE}"
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+    spec:
+      containerConcurrency: ${PROCESSOR_CONCURRENCY}   # eventos en vuelo por pod; Knative agrega pods al llenarse
+      timeoutSeconds: 120
+      enableServiceLinks: false
+      containers:
+        - image: ${IMAGE}
+          imagePullPolicy: IfNotPresent
+          # Un solo proceso: el lote se arma en memoria y lo comparten todos los hilos
+          command: ["gunicorn", "--bind", ":8080", "--workers", "1", "--threads", "${PROCESSOR_THREADS}",
+                    "--timeout", "120", "handler:app"]
+          ports:
+            - containerPort: 8080
+          env:
+            - { name: NEO4J_URL, value: "http://neo4j.${NAMESPACE}.svc.cluster.local:7474" }
+            - { name: NEO4J_USER, value: neo4j }
+            - name: NEO4J_PASS
+              valueFrom:
+                secretKeyRef: { name: neo4j-auth, key: password }
+            - { name: BATCH_SIZE, value: "${BATCH_SIZE}" }
+            - { name: BATCHING_WINDOW_MS, value: "${BATCHING_WINDOW_MS}" }
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { memory: "${PROCESSOR_MEMORY}Mi" }
