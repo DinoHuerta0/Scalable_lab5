@@ -399,6 +399,12 @@ aws sqs get-queue-attributes --queue-url "$(terraform -chdir=../infra output -ra
 ## Resultados
 <!-- Agrega aquí tus capturas en docs/ y tus conclusiones -->
 
+![Load Test](docs/load_test.png)
+![Metrics](docs/metrics.png)
+![Grafana Dashboard](docs/grafana_1.png)
+![Grafana Dashboard](docs/grafana_2.png)
+![Grafana Dashboard](docs/grafana_3.png)
+
 ### Prueba de carga de la API
 `load_test.py` con `shards=4`, `parallelization_factor=2`, un envío por petición y 60 s por escalón (`load-20261018-185114`).
 
